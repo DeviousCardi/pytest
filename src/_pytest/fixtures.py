@@ -31,6 +31,7 @@ from typing import overload
 from typing import TYPE_CHECKING
 from typing import TypeVar
 import warnings
+from weakref import WeakKeyDictionary
 
 import _pytest
 from _pytest import nodes
@@ -1761,6 +1762,41 @@ def deduplicate_names(*seqs: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(name for seq in seqs for name in seq))
 
 
+@dataclasses.dataclass(frozen=True)
+class _FixtureScanResult:
+    """Fixture attributes discovered in a plugin holder.
+
+    ``names`` is a snapshot of the holder's attribute names used to detect when
+    the cache became stale (attributes were added or removed).
+    """
+
+    names: frozenset[str]
+    fixture_names: tuple[str, ...]
+    wrapped_names: tuple[str, ...]
+
+
+# Fixture discovery only depends on the holder's class/module, which is shared
+# between Config instances. Keying by the holder object keeps entries bounded by
+# the number of loaded plugins, and weak references let them be collected with
+# the plugin. Modules, classes and instances used as plugins all support this.
+_fixture_scan_cache: Final[WeakKeyDictionary[object, _FixtureScanResult]] = (
+    WeakKeyDictionary()
+)
+
+
+def _get_scan_names(holderobj_tp: type | types.ModuleType) -> frozenset[str]:
+    """Return the attribute names that can hold fixtures on ``holderobj_tp``.
+
+    This mirrors the relevant part of ``dir()`` without materializing it: for
+    modules it is the module namespace, for classes it is the union of the
+    ``__dict__`` entries along the MRO. Instance attributes cannot contain
+    discoverable fixtures because they are looked up on the type.
+    """
+    if isinstance(holderobj_tp, types.ModuleType):
+        return frozenset(holderobj_tp.__dict__)
+    return frozenset(name for base in holderobj_tp.__mro__ for name in base.__dict__)
+
+
 class FixtureManager:
     """pytest fixture definitions and information is stored and managed
     from this class.
@@ -2188,7 +2224,7 @@ class FixtureManager:
             return unwrapped
         return None
 
-    def _check_for_wrapped_fixture(self, name: str, obj: object) -> None:
+    def _check_for_wrapped_fixture(self, name: str, obj: object) -> bool:
         """Warn if ``obj`` is a fixture hidden behind wrappers.
 
         ``obj`` must be the raw class/module ``__dict__`` entry (see
@@ -2198,11 +2234,14 @@ class FixtureManager:
         may still succeed, but the decorator order is wrong. A leading
         ``self``/``cls`` parameter already fails as a missing fixture and needs
         no extra special-casing here.
+
+        Returns whether ``obj`` is a wrapped fixture, so callers can replay the
+        warning from a cached scan.
         """
         fixture_def = self._find_wrapped_fixture_def(obj)
         # None: not a wrapped fixture. is obj: bare FixtureFunctionDefinition.
         if fixture_def is None or fixture_def is obj:
-            return
+            return False
 
         # warn_explicit_for needs a real function (__code__/__globals__).
         # @pytest.fixture above @classmethod/@staticmethod stores the descriptor
@@ -2211,7 +2250,7 @@ class FixtureManager:
         if type(fixture_func) is classmethod or type(fixture_func) is staticmethod:
             fixture_func = fixture_func.__func__
         if not isinstance(fixture_func, types.FunctionType):  # pragma: no cover
-            return
+            return True
 
         if type(obj) is classmethod:
             msg = (
@@ -2226,6 +2265,7 @@ class FixtureManager:
         else:
             msg = f"cannot discover fixture {name!r} due to being wrapped in decorators"
         warn_explicit_for(fixture_func, PytestWarning(msg))
+        return True
 
     @overload
     def parsefactories(
@@ -2305,49 +2345,87 @@ class FixtureManager:
         else:
             holderobj_tp = cast("type | types.ModuleType", holderobj)
 
-        for name in dir(holderobj):
-            # Read the raw __dict__ entry first so staticmethod/classmethod
-            # wrappers are not hidden by descriptor binding.
+        scan_names = _get_scan_names(holderobj_tp)
+        try:
+            scan = _fixture_scan_cache.get(holderobj_tp)
+        except TypeError:  # Unhashable/unweakref-able holder: don't cache.
+            scan = None
+        if scan is None or scan.names != scan_names:
+            fixture_names: list[str] = []
+            wrapped_names: list[str] = []
+            for name in sorted(scan_names):
+                # Read the raw __dict__ entry first so staticmethod/classmethod
+                # wrappers are not hidden by descriptor binding.
+                raw_obj = self._lookup_in_type_dict(holderobj_tp, name)
+                if raw_obj is not None and self._check_for_wrapped_fixture(
+                    name, raw_obj
+                ):
+                    wrapped_names.append(name)
+
+                # The attribute can be an arbitrary descriptor, so the attribute
+                # access below can raise. safe_getattr() ignores such exceptions.
+                obj_ub = safe_getattr(holderobj_tp, name, None)
+                if (
+                    type(obj_ub) is FixtureFunctionDefinition
+                    # On Python 3.9-3.12, classmethod chains through descriptors, so
+                    # getattr may return a FixtureFunctionDefinition even when the
+                    # raw __dict__ entry is classmethod(fixture). Do not register
+                    # that case; users must put @pytest.fixture above @classmethod.
+                    and type(raw_obj) is not classmethod
+                ):
+                    fixture_names.append(name)
+
+            scan = _FixtureScanResult(
+                names=scan_names,
+                fixture_names=tuple(fixture_names),
+                wrapped_names=tuple(wrapped_names),
+            )
+            try:
+                _fixture_scan_cache[holderobj_tp] = scan
+            except TypeError:  # Unhashable/unweakref-able holder: don't cache.
+                pass
+        else:
+            # The cached scan is still valid; only replay the warnings which are
+            # not a no-op. Fixture attributes are re-read below so a replaced
+            # fixture function is picked up.
+            for name in scan.wrapped_names:
+                raw_obj = self._lookup_in_type_dict(holderobj_tp, name)
+                if raw_obj is not None:
+                    self._check_for_wrapped_fixture(name, raw_obj)
+
+        for name in scan.fixture_names:
             raw_obj = self._lookup_in_type_dict(holderobj_tp, name)
-            if raw_obj is not None:
-                self._check_for_wrapped_fixture(name, raw_obj)
-
-            # The attribute can be an arbitrary descriptor, so the attribute
-            # access below can raise. safe_getattr() ignores such exceptions.
             obj_ub = safe_getattr(holderobj_tp, name, None)
-            if type(obj_ub) is FixtureFunctionDefinition:
-                # On Python 3.9-3.12, classmethod chains through descriptors, so
-                # getattr may return a FixtureFunctionDefinition even when the
-                # raw __dict__ entry is classmethod(fixture). Do not register
-                # that case; users must put @pytest.fixture above @classmethod.
-                if type(raw_obj) is classmethod:
-                    continue
+            if type(obj_ub) is not FixtureFunctionDefinition:
+                continue
+            if type(raw_obj) is classmethod:
+                continue
 
-                marker = obj_ub._fixture_function_marker
-                if marker.name:
-                    fixture_name = marker.name
-                else:
-                    fixture_name = name
+            marker = obj_ub._fixture_function_marker
+            if marker.name:
+                fixture_name = marker.name
+            else:
+                fixture_name = name
 
-                # OK we know it is a fixture -- now safe to look up on the _instance_.
-                try:
-                    obj = getattr(holderobj, name)
-                # if the fixture is named in the decorator we cannot find it in the module
-                except AttributeError:
-                    obj = obj_ub
+            # OK we know it is a fixture -- now safe to look up on the _instance_.
+            try:
+                obj = getattr(holderobj, name)
+            # if the fixture is named in the decorator we cannot find it in the module
+            except AttributeError:
+                obj = obj_ub
 
-                func = obj._get_wrapped_function()
+            func = obj._get_wrapped_function()
 
-                self._register_fixture(
-                    name=fixture_name,
-                    func=func,
-                    scope=marker.scope,
-                    params=marker.params,
-                    ids=marker.ids,
-                    autouse=marker.autouse,
-                    node=effective_node,
-                    nodeid=effective_nodeid,
-                )
+            self._register_fixture(
+                name=fixture_name,
+                func=func,
+                scope=marker.scope,
+                params=marker.params,
+                ids=marker.ids,
+                autouse=marker.autouse,
+                node=effective_node,
+                nodeid=effective_nodeid,
+            )
 
     def _get_all_fixture_defs(self) -> Iterable[FixtureDef[Any]]:
         """Get all FixtureDefs.

@@ -10,6 +10,7 @@ import textwrap
 from _pytest.compat import getfuncargnames
 from _pytest.config import ExitCode
 from _pytest.fixtures import deduplicate_names
+from _pytest.fixtures import FixtureManager
 from _pytest.fixtures import ParamValueKey
 from _pytest.fixtures import TopRequest
 from _pytest.monkeypatch import MonkeyPatch
@@ -1967,6 +1968,81 @@ class TestFixtureManagerParseFactories:
         )
         reprec = pytester.inline_run("-s")
         reprec.assertoutcome(passed=1)
+
+    def test_parsefactories_does_not_rescan_unchanged_plugin(
+        self, pytester: Pytester, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Attribute scans are cached, while fixtures are still registered."""
+        scanned: list[str] = []
+        original = FixtureManager._check_for_wrapped_fixture
+
+        def counting(self, name: str, obj: object) -> bool:
+            if name.startswith("scan_probe_"):
+                scanned.append(name)
+            return original(self, name, obj)
+
+        monkeypatch.setattr(FixtureManager, "_check_for_wrapped_fixture", counting)
+
+        class Plugin:
+            scan_probe_a = 1
+            scan_probe_b = 2
+            scan_probe_c = 3
+
+            @pytest.fixture
+            def scan_cached_fixture(self):
+                return 42
+
+        plugin = Plugin()
+        pytester.makepyfile(
+            """
+            def test_ok(scan_cached_fixture):
+                assert scan_cached_fixture == 42
+            """
+        )
+
+        counts = []
+        for _ in range(3):
+            scanned.clear()
+            pytester.inline_run(plugins=[plugin]).assertoutcome(passed=1)
+            counts.append(len(scanned))
+
+        assert counts[0] == 3
+        assert counts[1:] == [0, 0]
+
+    def test_parsefactories_cached_scan_handles_added_fixture(
+        self, pytester: Pytester, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Adding an attribute invalidates the cached scan for that holder."""
+        scanned: list[str] = []
+        original = FixtureManager._check_for_wrapped_fixture
+
+        def counting(self, name: str, obj: object) -> bool:
+            scanned.append(name)
+            return original(self, name, obj)
+
+        monkeypatch.setattr(FixtureManager, "_check_for_wrapped_fixture", counting)
+
+        class Plugin:
+            scan_probe_existing = 1
+
+        plugin = Plugin()
+        pytester.makepyfile("def test_ok(): pass")
+        pytester.inline_run(plugins=[plugin]).assertoutcome(passed=1)
+
+        @pytest.fixture
+        def scan_added_fixture(self):
+            return 42
+
+        Plugin.scan_added_fixture = scan_added_fixture
+        pytester.makepyfile(
+            """
+            def test_ok(scan_added_fixture):
+                assert scan_added_fixture == 42
+            """
+        )
+        scanned.clear()
+        pytester.inline_run(plugins=[plugin]).assertoutcome(passed=1)
+        assert "scan_added_fixture" in scanned
 
     def test_parsefactories_conftest_and_module_and_class(
         self, pytester: Pytester

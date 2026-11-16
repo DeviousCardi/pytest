@@ -1,0 +1,1 @@
+Fixture discovery is now cached per plugin, avoiding repeated attribute scans when many Config objects are created.
